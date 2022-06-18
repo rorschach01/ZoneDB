@@ -44,6 +44,8 @@
 #include "util/stop_watch.h"
 #include "util/thread_local.h"
 
+#include "utilities/nvm_mod/nvm_cf_mod.h"
+
 namespace rocksdb {
 
 class Arena;
@@ -172,6 +174,9 @@ class CompactionJob {
   // Stores the approx size of keys covered in the range of each subcompaction
   std::vector<uint64_t> sizes_;
   Env::WriteLifeTimeHint write_hint_;
+
+  uint64_t IO_delete_nums = 0;
+  uint64_t deleted = false;
 };
 
 }  // namespace rocksdb

@@ -63,6 +63,8 @@
 #include "util/string_util.h"
 #include "util/sync_point.h"
 
+#include "utilities/nvm_mod/global_statistic.h"
+
 namespace rocksdb {
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
@@ -714,10 +716,15 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
   cfd->internal_stats()->AddCompactionStats(
       compact_->compaction->output_level(), compaction_stats_);
-
+  RECORD_LOG("CompactionJob::Install start\n");
   if (status.ok()) {
+    // 将 input 的文件加入 delete 的列表
     status = InstallCompactionResults(mutable_cf_options);
+    if(compact_->compaction->GetColumnCompactionItem() != nullptr){
+      compact_->compaction->InstallColumnCompactionItem();
+    }
   }
+  RECORD_LOG("CompactionJob::Install end\n");
   VersionStorageInfo::LevelSummaryStorage tmp;
   auto vstorage = cfd->current()->storage_info();
   const auto& stats = compaction_stats_;
@@ -741,6 +748,22 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
     bytes_written_per_sec =
         stats.bytes_written / static_cast<double>(stats.micros);
   }
+
+#ifdef STATISTIC_OPEN
+  if (compact_->compaction->GetColumnCompactionItem() == nullptr) {  //正常
+    global_stats.IO_delete_key_nums += IO_delete_nums;
+    uint64_t read_all = stats.bytes_read_non_output_levels + stats.bytes_read_output_level;
+    uint64_t start_time = get_now_micros() - stats.micros - global_stats.start_time;
+    RECORD_INFO(3,"compaction:%ld,read(MB):%.2f,write(MB):%.2f,time(s):%.5f,start(s):%.3f,is_level0:%d,IO_delete_key_nums:,%ld\n",
+      ++global_stats.compaction_num, 1.0*read_all/1048576.0,1.0*stats.bytes_written/1048576.0,1.0*stats.micros*1e-6,1.0*start_time*1e-6,false,IO_delete_nums);
+  }
+  else{  //column compaction
+    uint64_t read_all = compact_->compaction->GetColumnCompactionItem()->L0select_size + stats.bytes_read_output_level;
+        uint64_t start_time = get_now_micros() - stats.micros - global_stats.start_time;
+    RECORD_INFO(3,"compaction:%ld,read(MB):%.2f,write(MB):%.2f,time(s):%.5f,start(s):%.3f,is_level0:%d\n",
+      ++global_stats.compaction_num, 1.0*read_all/1048576.0,1.0*stats.bytes_written/1048576.0,1.0*stats.micros*1e-6,1.0*start_time*1e-6,true);
+  }
+#endif
 
   ROCKS_LOG_BUFFER(
       log_buffer_,
@@ -799,6 +822,7 @@ Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   stream.EndArray();
 
   CleanupCompaction();
+  //log_buffer_->FlushBufferToLog();
   return status;
 }
 
@@ -810,9 +834,19 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
 
   // Although the v2 aggregator is what the level iterator(s) know about,
   // the AddTombstones calls will be propagated down to the v1 aggregator.
-  std::unique_ptr<InternalIterator> input(versions_->MakeInputIterator(
+  std::unique_ptr<InternalIterator> input = nullptr;
+  if(sub_compact->compaction->GetColumnCompactionItem() == nullptr){
+    input.reset(versions_->MakeInputIterator(
       sub_compact->compaction, &range_del_agg, env_optiosn_for_read_));
-
+  }
+  else{  //column compaction
+    RECORD_LOG("column compaction job run\n");
+    log_buffer_->FlushBufferToLog();
+    // 最终会将需要遍历的 key-value 封装成 vector<slice> 的迭代器返回 
+    input.reset(versions_->MakeColumnCompactionInputIterator(
+      sub_compact->compaction, &range_del_agg, env_optiosn_for_read_));
+    RECORD_LOG("column compaction job MakeColumnCompactionInputIterator\n");
+  }
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_COMPACTION_PROCESS_KV);
 
@@ -904,6 +938,9 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
       shutting_down_, preserve_deletes_seqnum_));
   auto c_iter = sub_compact->c_iter.get();
   c_iter->SeekToFirst();
+  //I/O过滤模块初始化
+  FileEntry* zonefile = nullptr;
+
   if (c_iter->Valid() && sub_compact->compaction->output_level() != 0) {
     // ShouldStopBefore() maintains state based on keys processed so far. The
     // compaction loop always calls it on the "next" key, thus won't tell it the
@@ -918,13 +955,40 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   size_t data_begin_offset = 0;
   std::string dict_sample_data;
   dict_sample_data.reserve(kSampleBytes);
-
+  //KV 对写入 block
   while (status.ok() && !cfd->IsDropped() && c_iter->Valid()) {
     // Invariant: c_iter.status() is guaranteed to be OK if c_iter->Valid()
     // returns true.
     const Slice& key = c_iter->key();
     const Slice& value = c_iter->value();
 
+    //I/O过滤，输出层大于L1的层
+    if(sub_compact->compaction->output_level() > 1 && deleted){
+      bool key_is_in_l0 = false;   
+      //int searchfilenum = 0;   
+      for(uint64_t i = 0; i < cfd->nvmcfmodule->GetFileNum(); i++){
+        zonefile = cfd->nvmcfmodule->GetFile(i);
+        if(!zonefile->compacting){
+            std::unordered_map<std::string,int>::const_iterator iter = zonefile->key_hash_index.find(c_iter->user_key().ToString(true));
+            if(iter != zonefile->key_hash_index.end()){
+            /*if(iter != zonefile->key_hash_index.end() && \
+              cfd->user_comparator()->Compare(c_iter->user_key(), ExtractUserKey(zonefile->keys_meta[iter->second].key.Encode()))==0){*/
+              key_is_in_l0 = true;
+              break;  
+            }
+            //searchfilenum++;
+        }
+        /*if(searchfilenum == 10){
+            break;
+        }*/  
+      }
+      if(key_is_in_l0){
+        IO_delete_nums++;
+        c_iter->Next();
+        continue;
+      }      
+    }
+      
     // If an end key (exclusive) is specified, check if the current key is
     // >= than it and exit if it is because the iterator is out of its range
     if (end != nullptr &&
@@ -947,6 +1011,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
     }
     assert(sub_compact->builder != nullptr);
     assert(sub_compact->current_output() != nullptr);
+    //实际写入 KV 对
     sub_compact->builder->Add(key, value);
     sub_compact->current_output_file_size = sub_compact->builder->FileSize();
     sub_compact->current_output()->meta.UpdateBoundaries(
@@ -1368,9 +1433,9 @@ Status CompactionJob::FinishCompactionOutputFile(
         std::make_shared<TableProperties>(tp);
     ROCKS_LOG_INFO(db_options_.info_log,
                    "[%s] [JOB %d] Generated table #%" PRIu64 ": %" PRIu64
-                   " keys, %" PRIu64 " bytes%s",
+                   " keys, %" PRIu64 " bytes [%s-%s] %s",
                    cfd->GetName().c_str(), job_id_, output_number,
-                   current_entries, current_bytes,
+                   current_entries, current_bytes, meta->smallest.DebugString(true).c_str(), meta->largest.DebugString(true).c_str(),
                    meta->marked_for_compaction ? " (need compaction)" : "");
   }
   std::string fname;
@@ -1442,7 +1507,7 @@ Status CompactionJob::InstallCompactionResults(
 
   // Add compaction inputs
   compaction->AddInputDeletions(compact_->compaction->edit());
-
+  //compaction->InstallColumnCompactionItem(compact_->compaction->edit());
   for (const auto& sub_compact : compact_->sub_compact_states) {
     for (const auto& out : sub_compact.outputs) {
       compaction->edit()->AddFile(compaction->output_level(), out.meta);
@@ -1631,6 +1696,14 @@ void CompactionJob::UpdateCompactionInputStatsHelper(int* num_files,
   auto num_input_files = compaction->num_input_files(input_level);
   *num_files += static_cast<int>(num_input_files);
 
+  if(compaction->GetColumnCompactionItem() != nullptr && input_level == 0) {
+    *bytes_read += compaction->GetColumnCompactionItem()->L0select_size;
+    for(unsigned int i = 0;i < compaction->GetColumnCompactionItem()->keys_num.size();i++){
+      compaction_stats_.num_input_records += compaction->GetColumnCompactionItem()->keys_num[i];
+    }
+    return;
+  }
+
   for (size_t i = 0; i < num_input_files; ++i) {
     const auto* file_meta = compaction->input(input_level, i);
     *bytes_read += file_meta->fd.GetFileSize();
@@ -1682,10 +1755,17 @@ void CompactionJob::LogCompaction() {
   // we're not logging
   if (db_options_.info_log_level <= InfoLogLevel::INFO_LEVEL) {
     Compaction::InputLevelSummaryBuffer inputs_summary;
+#ifdef STATISTIC_OPEN
+    ROCKS_LOG_INFO(
+        db_options_.info_log, "[%s] [JOB %d] %ld Compacting %s, score %.2f",
+        cfd->GetName().c_str(), job_id_,global_stats.compaction_num + 1,
+        compaction->InputLevelSummary(&inputs_summary), compaction->score());
+#else 
     ROCKS_LOG_INFO(
         db_options_.info_log, "[%s] [JOB %d] Compacting %s, score %.2f",
         cfd->GetName().c_str(), job_id_,
         compaction->InputLevelSummary(&inputs_summary), compaction->score());
+#endif
     char scratch[2345];
     compaction->Summary(scratch, sizeof(scratch));
     ROCKS_LOG_INFO(db_options_.info_log, "[%s] Compaction start summary: %s\n",

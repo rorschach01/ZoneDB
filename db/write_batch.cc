@@ -1243,7 +1243,11 @@ class MemTableInserter : public WriteBatch::Handler {
       return seek_status;
     }
     Status ret_status;
-
+    // memtable 数据写入
+    Trie* trie_ = nullptr;
+    if(cf_mems_->current()->nvmcfmodule!=nullptr){
+      trie_ = cf_mems_->current()->nvmcfmodule->GetTrie();
+    }
     MemTable* mem = cf_mems_->GetMemTable();
     auto* moptions = mem->GetImmutableMemTableOptions();
     // inplace_update_support is inconsistent with snapshots, and therefore with
@@ -1252,7 +1256,7 @@ class MemTableInserter : public WriteBatch::Handler {
     if (!moptions->inplace_update_support) {
       bool mem_res =
           mem->Add(sequence_, value_type, key, value,
-                   concurrent_memtable_writes_, get_post_process_info(mem));
+                   concurrent_memtable_writes_, get_post_process_info(mem), trie_);
       if (UNLIKELY(!mem_res)) {
         assert(seq_per_batch_);
         ret_status = Status::TryAgain("key+seq exists");

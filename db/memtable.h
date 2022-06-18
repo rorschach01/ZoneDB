@@ -28,6 +28,7 @@
 #include "util/concurrent_arena.h"
 #include "util/dynamic_bloom.h"
 #include "util/hash.h"
+#include "utilities/nvm_mod/trie.h"
 
 namespace rocksdb {
 
@@ -172,7 +173,7 @@ class MemTable {
   // the <key, seq> already exists.
   bool Add(SequenceNumber seq, ValueType type, const Slice& key,
            const Slice& value, bool allow_concurrent = false,
-           MemTablePostProcessInfo* post_process_info = nullptr);
+           MemTablePostProcessInfo* post_process_info = nullptr, Trie* trie_ = nullptr);
 
   // If memtable contains a value for key, store it in *value and return true.
   // If memtable contains a deletion for key, store a NotFound() error

@@ -52,6 +52,7 @@
 #include "util/allocator.h"
 #include "util/coding.h"
 #include "util/random.h"
+#include "utilities/nvm_mod/my_log.h"
 
 namespace rocksdb {
 
@@ -716,6 +717,7 @@ bool InlineSkipList<Comparator>::Insert(const char* key, Splice* splice,
                                         bool allow_partial_splice_fix) {
   Node* x = reinterpret_cast<Node*>(const_cast<char*>(key)) - 1;
   const DecodedKey key_decoded = compare_.decode_key(key);
+  //RECORD_LOG("DecondedKey size:%d \n", key_decoded.size_);
   int height = x->UnstashHeight();
   assert(height >= 1 && height <= kMaxHeight_);
 

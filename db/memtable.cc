@@ -38,6 +38,7 @@
 #include "util/murmurhash.h"
 #include "util/mutexlock.h"
 #include "util/util.h"
+#include "utilities/nvm_mod/my_log.h"
 
 namespace rocksdb {
 
@@ -461,7 +462,7 @@ MemTable::MemTableStats MemTable::ApproximateStats(const Slice& start_ikey,
 bool MemTable::Add(SequenceNumber s, ValueType type,
                    const Slice& key, /* user key */
                    const Slice& value, bool allow_concurrent,
-                   MemTablePostProcessInfo* post_process_info) {
+                   MemTablePostProcessInfo* post_process_info, Trie* trie_) {
   // Format of an entry is concatenation of:
   //  key_size     : varint32 of internal_key.size()
   //  key bytes    : char[internal_key.size()]
@@ -478,16 +479,38 @@ bool MemTable::Add(SequenceNumber s, ValueType type,
       type == kTypeRangeDeletion ? range_del_table_ : table_;
   KeyHandle handle = table->Allocate(encoded_len, &buf);
 
+  //这里是把 uint32_t 改成 Varint32 保存在字符串中
   char* p = EncodeVarint32(buf, internal_key_size);
   memcpy(p, key.data(), key_size);
   Slice key_slice(p, key_size);
   p += key_size;
+  // 将 Sequence 和 Type 进行编码
   uint64_t packed = PackSequenceAndType(s, type);
   EncodeFixed64(p, packed);
   p += 8;
   p = EncodeVarint32(p, val_size);
   memcpy(p, value.data(), val_size);
   assert((unsigned)(p + val_size - buf) == (unsigned)encoded_len);
+
+  //前缀树插入key
+  if (trie_!=nullptr && !trie_->complete_trie()) {
+    char* p_copy = nullptr;
+    p_copy = (char*)malloc((key_size+8)*sizeof(char));
+    memcpy(p_copy, key.data(), key_size);
+    Slice key_slice_copy(p_copy, key_size);
+    SequenceNumber s_copy(s);
+    ValueType type_copy(type);
+
+    InternalKey key_trie(key_slice_copy, s_copy, type_copy);
+
+    trie_->insert(key_trie.Encode());
+
+    if(trie_->complete_trie()){
+      int zones_size = trie_->analyse_zones()+1;
+      RECORD_LOG("zones split completed! zones_size:%d \n", zones_size);
+    }
+  }
+
   if (!allow_concurrent) {
     // Extract prefix for insert with hint.
     if (insert_with_hint_prefix_extractor_ != nullptr &&

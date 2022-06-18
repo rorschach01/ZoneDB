@@ -78,7 +78,10 @@ class DBImpl : public DB {
   DBImpl(const DBOptions& options, const std::string& dbname,
          const bool seq_per_batch = false, const bool batch_per_txn = true);
   virtual ~DBImpl();
-
+////
+  using DB::HaveBalancedDistribution;
+  virtual bool HaveBalancedDistribution(ColumnFamilyHandle* column_family) override;
+////
   using DB::Resume;
   virtual Status Resume() override;
 
@@ -883,7 +886,7 @@ class DBImpl : public DB {
   // Delete obsolete files and log status and information of file deletion
   void DeleteObsoleteFileImpl(int job_id, const std::string& fname,
                               const std::string& path_to_sync, FileType type,
-                              uint64_t number);
+                              uint64_t number,std::vector<NvmCfModule*> *nvmcfs = nullptr);
 
   // Background process needs to call
   //     auto x = CaptureCurrentFileNumberInPendingOutputs()
@@ -935,7 +938,16 @@ class DBImpl : public DB {
     // requires a SuperVersionContext object (currently embedded in JobContext).
     SuperVersionContext* superversion_context_;
   };
-
+///
+Status FlushMemTableToNvm(ColumnFamilyData *cfd,
+                                 const MutableCFOptions &mutable_cf_options,
+                                 bool *made_progress, JobContext *job_context,
+                                 SuperVersionContext *superversion_context,
+                                 LogBuffer *log_buffer);
+Status FlushMemTablesToNvm(
+      const autovector<BGFlushArg>& bg_flush_args, bool* made_progress,
+      JobContext* job_context, LogBuffer* log_buffer);
+///
   // Flush the memtables of (multiple) column families to multiple files on
   // persistent storage.
   Status FlushMemTablesToOutputFiles(
